@@ -430,7 +430,240 @@ def upload_to_s3(
 
 
 # =========================
-# 6. OPTIONAL PREDICT SAMPLE
+# 6. CONVERT TO ONNX + OPENVINO IR
+# =========================
+@dsl.component(
+    base_image="registry.access.redhat.com/ubi9/python-311:latest",
+    packages_to_install=["torch", "onnx", "onnxscript", "openvino", "boto3"]
+)
+def convert_to_openvino(
+    model_artifact: Input[Model],
+    s3_endpoint: str,
+    s3_bucket: str,
+    s3_prefix: str,
+    aws_access_key_id: str,
+    aws_secret_access_key: str,
+    aws_region: str = "us-east-1",
+    openvino_s3_prefix: Output[Artifact] = None,
+):
+    import os
+    import torch
+    import torch.nn as nn
+    import openvino as ov
+    import boto3
+
+    device = torch.device("cpu")
+
+    checkpoint = torch.load(model_artifact.path, map_location=device)
+    input_dim = checkpoint["input_dim"]
+
+    class CustomerClassifier(nn.Module):
+        def __init__(self, input_dim: int):
+            super().__init__()
+            self.network = nn.Sequential(
+                nn.Linear(input_dim, 32),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(32, 16),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(16, 1)
+            )
+
+        def forward(self, x):
+            return self.network(x)
+
+    model = CustomerClassifier(input_dim=input_dim).to(device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    # Step 1: PyTorch -> ONNX (single file, no external data)
+    onnx_path = "/tmp/model.onnx"
+    dummy_input = torch.randn(1, input_dim)
+    torch.onnx.export(
+        model,
+        dummy_input,
+        onnx_path,
+        opset_version=17,
+        input_names=["input"],
+        output_names=["output"],
+        dynamic_axes={"input": {0: "batch_size"}, "output": {0: "batch_size"}},
+    )
+
+    # Consolidate external data into single file if it was split
+    import onnx
+    onnx_model = onnx.load(onnx_path)
+    onnx.save_model(
+        onnx_model,
+        onnx_path,
+        save_as_external_data=False,
+    )
+    print(f"ONNX model saved to: {onnx_path}")
+
+    # Step 2: ONNX -> OpenVINO IR
+    ov_output_dir = "/tmp/openvino"
+    os.makedirs(ov_output_dir, exist_ok=True)
+
+    ov_model = ov.convert_model(onnx_path)
+    xml_path = os.path.join(ov_output_dir, "model.xml")
+    ov.save_model(ov_model, xml_path)
+    bin_path = os.path.join(ov_output_dir, "model.bin")
+    print(f"OpenVINO IR saved: {xml_path}, {bin_path}")
+
+    # Step 3: Upload IR + ONNX to S3
+    session = boto3.session.Session()
+    s3 = session.client(
+        service_name="s3",
+        endpoint_url=s3_endpoint,
+        aws_access_key_id=aws_access_key_id,
+        aws_secret_access_key=aws_secret_access_key,
+        region_name=aws_region,
+    )
+
+    ov_prefix = f"{s3_prefix}/openvino/1"
+    files_to_upload = [
+        (xml_path, f"{ov_prefix}/model.xml"),
+        (bin_path, f"{ov_prefix}/model.bin"),
+        (onnx_path, f"{s3_prefix}/model.onnx"),
+    ]
+
+    for local_path, s3_key in files_to_upload:
+        s3.upload_file(local_path, s3_bucket, s3_key)
+        print(f"Uploaded {local_path} -> s3://{s3_bucket}/{s3_key}")
+
+    # Write the OV S3 prefix to artifact for downstream use
+    with open(openvino_s3_prefix.path, "w") as f:
+        f.write(ov_prefix)
+
+    print("Conversion and upload to S3 finished.")
+    print(f"OVMS model path: s3://{s3_bucket}/{ov_prefix}/")
+
+
+# =========================
+# 7. REGISTER MODEL IN RHOAI MODEL REGISTRY
+# =========================
+@dsl.component(
+    base_image="registry.access.redhat.com/ubi9/python-311:latest",
+    packages_to_install=["requests"]
+)
+def register_model(
+    evaluation_metrics: Input[Artifact],
+    openvino_s3_prefix: Input[Artifact],
+    model_registry_url: str,
+    model_name: str = "nieruchomosci",
+    model_description: str = "PyTorch binary classifier - customer purchase prediction",
+    s3_bucket: str = "",
+    s3_endpoint: str = "",
+):
+    import json
+    import requests
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+    session = requests.Session()
+    session.verify = False
+    session.headers.update({"Authorization": f"Bearer sha256~nWcDj-iH38Dhc03pbNOEjBTnBUihf3JIZ2ItAdnQ5U4"})
+
+    with open(evaluation_metrics.path, "r") as f:
+        metrics = json.load(f)
+
+    with open(openvino_s3_prefix.path, "r") as f:
+        ov_prefix = f.read().strip()
+
+    model_uri = f"s3://{s3_bucket}/{ov_prefix}"
+
+    # --- 1. Register or get RegisteredModel ---
+    reg_model_url = f"{model_registry_url}/api/model_registry/v1alpha3/registered_models"
+    list_resp = session.get(reg_model_url)
+    list_resp.raise_for_status()
+    existing = [m for m in list_resp.json().get("items", []) if m["name"] == model_name]
+
+    if existing:
+        registered_model_id = existing[0]["id"]
+        current_state = existing[0].get("state", "LIVE")
+        print(f"Found existing registered model: id={registered_model_id}, state={current_state}")
+
+        if current_state == "ARCHIVED":
+            patch_resp = session.patch(
+                f"{reg_model_url}/{registered_model_id}",
+                json={"state": "LIVE"}
+            )
+            patch_resp.raise_for_status()
+            print(f"Reactivated model from ARCHIVED to LIVE")
+    else:
+        reg_payload = {
+            "name": model_name,
+            "description": model_description,
+            "customProperties": {}
+        }
+        resp = session.post(reg_model_url, json=reg_payload)
+        resp.raise_for_status()
+        registered_model_id = resp.json()["id"]
+        print(f"Registered model created: id={registered_model_id}")
+
+    # --- 2. Create ModelVersion ---
+    mv_url = f"{model_registry_url}/api/model_registry/v1alpha3/model_versions"
+
+    # Check if version already exists
+    existing_versions_resp = session.get(f"{reg_model_url}/{registered_model_id}/versions")
+    existing_versions_resp.raise_for_status()
+    existing_versions = existing_versions_resp.json().get("items", [])
+    version_name = "v1"
+    existing_ver = [v for v in existing_versions if v["name"] == version_name]
+
+    if existing_ver:
+        model_version_id = existing_ver[0]["id"]
+        print(f"ModelVersion already exists: id={model_version_id}")
+    else:
+        mv_payload = {
+            "name": version_name,
+            "registeredModelId": registered_model_id,
+            "customProperties": {
+                "accuracy": {"metadataType": "MetadataStringValue", "string_value": str(round(metrics.get("accuracy", 0), 4))},
+                "f1": {"metadataType": "MetadataStringValue", "string_value": str(round(metrics.get("f1", 0), 4))},
+                "roc_auc": {"metadataType": "MetadataStringValue", "string_value": str(round(metrics.get("roc_auc", 0), 4))},
+                "format": {"metadataType": "MetadataStringValue", "string_value": "openvino_ir"},
+            }
+        }
+        mv_resp = session.post(mv_url, json=mv_payload)
+        mv_resp.raise_for_status()
+        model_version_id = mv_resp.json()["id"]
+        print(f"ModelVersion created: id={model_version_id}")
+
+    # --- 3. Create ModelArtifact ---
+    ma_url = f"{model_registry_url}/api/model_registry/v1alpha3/model_versions/{model_version_id}/artifacts"
+
+    existing_artifacts_resp = session.get(ma_url)
+    existing_artifacts_resp.raise_for_status()
+    existing_artifacts = existing_artifacts_resp.json().get("items", [])
+    artifact_name = f"{model_name}-openvino"
+    existing_artifact = [a for a in existing_artifacts if a["name"] == artifact_name]
+
+    if existing_artifact:
+        print(f"ModelArtifact already exists: id={existing_artifact[0]['id']}")
+    else:
+        ma_payload = {
+            "name": artifact_name,
+            "description": "OpenVINO IR artifact (.xml + .bin)",
+            "uri": model_uri,
+            "modelFormatName": "openvino_ir",
+            "modelFormatVersion": "openvino",
+            "storageKey": "aws-connection-models",
+            "storagePath": ov_prefix,
+            "artifactType": "model-artifact",
+        }
+        ma_resp = session.post(ma_url, json=ma_payload)
+        ma_resp.raise_for_status()
+        print(f"ModelArtifact created: id={ma_resp.json()['id']}")
+
+    print(f"Model registered at: {model_uri}")
+    ma_resp.raise_for_status()
+    print(f"ModelArtifact created: id={ma_resp.json()['id']}")
+    print(f"Model registered at: {model_uri}")
+
+
+# =========================
+# 8. OPTIONAL PREDICT SAMPLE
 # =========================
 @dsl.component(
     base_image="registry.access.redhat.com/ubi9/python-311:latest",
@@ -507,12 +740,16 @@ def enterprise_pytorch_pipeline(
     batch_size: int = 32,
     learning_rate: float = 0.001,
     upload_enabled: bool = True,
-    s3_endpoint: str = "http://minio.minio.svc.cluster.local:9000",
-    s3_bucket: str = "models",
-    s3_prefix: str = "customer-classifier/run-001",
-    aws_access_key_id: str = "minioadmin",
-    aws_secret_access_key: str = "minioadmin",
+    s3_endpoint: str = "https://s3.openshift-storage.svc:443",
+    s3_bucket: str = "models-062f015a-ce33-4f0b-b33c-af2505cfd4da",
+    s3_prefix: str = "models/1",
+    aws_access_key_id: str = "dTsNXjIOWoTZhB06a6re",
+    aws_secret_access_key: str = "Zgyn3Ha90k9AleDrowfjLfgjzuuTAsFML8Xy9yeq",
     aws_region: str = "us-east-1",
+    # Conversion + Model Registry
+    convert_and_register_enabled: bool = True,
+    model_registry_url: str = "https://private-model-registry.rhoai-model-registries.svc.cluster.local:8443",
+    model_name: str = "nieruchomosci",
 ):
     load_task = load_data(input_csv_path=input_csv_path)
 
@@ -560,6 +797,28 @@ def enterprise_pytorch_pipeline(
             aws_region=aws_region,
         )
         upload_task.set_caching_options(enable_caching=False)
+
+    with dsl.If(convert_and_register_enabled == True):
+        convert_task = convert_to_openvino(
+            model_artifact=train_task.outputs["model_artifact"],
+            s3_endpoint=s3_endpoint,
+            s3_bucket=s3_bucket,
+            s3_prefix=s3_prefix,
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key,
+            aws_region=aws_region,
+        )
+        convert_task.set_caching_options(enable_caching=False)
+
+        register_task = register_model(
+            evaluation_metrics=evaluate_task.outputs["evaluation_metrics"],
+            openvino_s3_prefix=convert_task.outputs["openvino_s3_prefix"],
+            model_registry_url=model_registry_url,
+            model_name=model_name,
+            s3_bucket=s3_bucket,
+            s3_endpoint=s3_endpoint,
+        )
+        register_task.set_caching_options(enable_caching=False)
 
 
 # =========================
