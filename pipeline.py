@@ -2,9 +2,9 @@ from kfp import dsl, compiler
 from kfp.dsl import Input, Output, Dataset, Model, Artifact, Metrics, ClassificationMetrics
 
 
-# =========================
+# ==========================
 # 1. LOAD DATA
-# =========================
+# ==========================
 @dsl.component(
     base_image="registry.access.redhat.com/ubi9/python-311:latest",
     packages_to_install=["pandas", "numpy"]
