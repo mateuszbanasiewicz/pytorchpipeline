@@ -562,7 +562,7 @@ def register_model(
 
     session = requests.Session()
     session.verify = False
-    session.headers.update({"Authorization": f"Bearer sha256~3ZwtfSILfriPatymTYYBGw8a7vVanwnuUTY6oquqpTY"})
+    session.headers.update({"Authorization": f"Bearer sha256~zUe90YRgSqBAn0_DA3u9xDXSFmhU7ijgX5xaYZ9MuiU"})
 
     with open(evaluation_metrics.path, "r") as f:
         metrics = json.load(f)
